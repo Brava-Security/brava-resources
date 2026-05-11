@@ -28,7 +28,7 @@ variable "brava_aws_account_id" {
 
 variable "brava_aws_role_name" {
   type        = string
-  description = "Brava Security's ECS task IAM role name (provided by Brava, e.g. 'brava-gcp-scanner-task-role')"
+  description = "Brava Security's ECS task IAM role name (provided by Brava during onboarding)"
 }
 
 variable "resource_suffix" {
