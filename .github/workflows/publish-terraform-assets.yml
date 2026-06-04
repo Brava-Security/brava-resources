@@ -27,6 +27,7 @@ jobs:
           fi
           mkdir -p dist
           find coverage -name '*.tf' -exec cp {} dist/ \;
+          # record the published file set in the CI log for auditing
           ls -l dist
 
       - name: Publish / refresh the rolling release
