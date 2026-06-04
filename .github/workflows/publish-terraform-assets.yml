@@ -1,0 +1,48 @@
+name: Publish Terraform assets
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'coverage/**/*.tf'
+  workflow_dispatch:   # lets you trigger a manual republish
+
+permissions:
+  contents: write       # required to create/edit releases
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Collect .tf files (flatten into dist/)
+        run: |
+          set -euo pipefail
+          # release assets are a flat namespace — fail loudly if two files share a basename
+          dups=$(find coverage -name '*.tf' -printf '%f\n' | sort | uniq -d)
+          if [ -n "$dups" ]; then
+            echo "::error::Duplicate .tf basenames would clobber each other: $dups"
+            exit 1
+          fi
+          mkdir -p dist
+          find coverage -name '*.tf' -exec cp {} dist/ \;
+          # record the published file set in the CI log for auditing
+          ls -l dist
+
+      - name: Publish / refresh the rolling release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG=tf-assets
+          # create the release once; on later runs it already exists
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" \
+              --title "Terraform assets (latest)" \
+              --notes "Auto-published Terraform files referenced by the Brava docs. Managed by CI — do not edit assets by hand." \
+              --latest
+          # overwrite the assets with the current files
+          gh release upload "$TAG" dist/*.tf --clobber
+          # keep this release marked as "latest" so /releases/latest/download resolves here
+          gh release edit "$TAG" --latest
