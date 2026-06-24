@@ -37,10 +37,15 @@ variable "resource_suffix" {
 # -------------------------
 
 locals {
-  suffix       = var.resource_suffix != "" ? "-${var.resource_suffix}" : ""
-  pool_id      = "brava-pool${local.suffix}"
-  provider_id  = "aws-provider${local.suffix}"
-  sa_id        = "brava-secops${local.suffix}"
+  suffix      = var.resource_suffix != "" ? "-${var.resource_suffix}" : ""
+  pool_id     = "brava-pool${local.suffix}"
+  provider_id = "aws-provider${local.suffix}"
+  sa_id       = "brava-secops${local.suffix}"
+
+  # Custom-role IDs allow only [A-Za-z0-9_.] (no hyphens), so the suffix is
+  # joined with an underscore and any hyphens are replaced.
+  role_suffix = var.resource_suffix != "" ? "_${replace(var.resource_suffix, "-", "_")}" : ""
+  role_id     = "bravaSecopsHygieneReader${local.role_suffix}"
 }
 
 # -------------------------
@@ -99,6 +104,52 @@ resource "google_service_account" "brava_secops_viewer" {
 resource "google_project_iam_member" "brava_chronicle_viewer" {
   project = var.gcp_project_id
   role    = "roles/chronicle.viewer"
+  member  = "serviceAccount:${google_service_account.brava_secops_viewer.email}"
+}
+
+# Custom read-only role: the ingestion/parsing reads NOT included in
+# roles/chronicle.viewer (feeds, parsers, parser extensions, parsing/validation
+# errors, log-type config, alert grouping). Every permission is read-only
+# (.get/.list) — no write/modify — and scoped to the Google SecOps domain.
+resource "google_project_iam_custom_role" "brava_secops_hygiene_reader" {
+  project     = var.gcp_project_id
+  role_id     = local.role_id
+  title       = "Brava Google SecOps Hygiene Reader${local.suffix}"
+  description = "Read-only ingestion/parsing permissions for Brava hygiene-service, on top of roles/chronicle.viewer."
+  stage       = "GA"
+
+  permissions = [
+    # Feeds (ingestion sources)
+    "chronicle.feeds.list",
+    "chronicle.feeds.get",
+    "chronicle.feedSourceTypeSchemas.list",
+
+    # Parsers, extensions & validation (normalization quality)
+    "chronicle.parsers.list",
+    "chronicle.parsers.get",
+    "chronicle.parserExtensions.list",
+    "chronicle.parserExtensions.get",
+    "chronicle.parsingErrors.list",
+    "chronicle.validationReports.get",
+    "chronicle.validationErrors.list",
+    "chronicle.extensionValidationReports.list",
+    "chronicle.extensionValidationReports.get",
+
+    # Log types & per-log-type config
+    "chronicle.logTypes.list",
+    "chronicle.logTypes.get",
+    "chronicle.logTypeSettings.list",
+    "chronicle.logTypeSettings.get",
+
+    # Detection tuning
+    "chronicle.alertGroupingRules.get",
+  ]
+}
+
+# Grant the custom hygiene-reader role to the same Brava SA.
+resource "google_project_iam_member" "brava_secops_hygiene_reader" {
+  project = var.gcp_project_id
+  role    = google_project_iam_custom_role.brava_secops_hygiene_reader.id
   member  = "serviceAccount:${google_service_account.brava_secops_viewer.email}"
 }
 
