@@ -114,7 +114,7 @@ resource "google_project_iam_member" "brava_chronicle_viewer" {
 resource "google_project_iam_custom_role" "brava_secops_hygiene_reader" {
   project     = var.gcp_project_id
   role_id     = local.role_id
-  title       = "Brava SecOps Hygiene Reader${local.suffix}"
+  title       = "Brava Google SecOps Hygiene Reader${local.suffix}"
   description = "Read-only ingestion/parsing permissions for Brava hygiene-service, on top of roles/chronicle.viewer."
   stage       = "GA"
 
