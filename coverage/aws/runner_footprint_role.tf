@@ -17,6 +17,12 @@ variable "brava_runner_role_arn" {
   type        = string
 }
 
+variable "external_id" {
+  description = "Optional STS external ID required when assuming the footprint role. Leave null/empty to disable the external ID check."
+  type        = string
+  default     = null
+}
+
 locals {
   role_name  = "brava-footprint-role"
   account_id = data.aws_caller_identity.current.account_id
@@ -41,11 +47,22 @@ resource "aws_iam_role" "footprint" {
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Effect    = "Allow"
-      Principal = { AWS = var.brava_runner_role_arn }
-      Action    = "sts:AssumeRole"
-    }]
+    Statement = [
+      merge(
+        {
+          Effect    = "Allow"
+          Principal = { AWS = var.brava_runner_role_arn }
+          Action    = "sts:AssumeRole"
+        },
+        var.external_id != null && var.external_id != "" ? {
+          Condition = {
+            StringEquals = {
+              "sts:ExternalId" = var.external_id
+            }
+          }
+        } : {}
+      )
+    ]
   })
 
   tags = {
