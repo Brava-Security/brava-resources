@@ -83,3 +83,59 @@ terraform apply \
 - **Privileged Role Administrator** (Entra) — to assign the Security Reader directory role and grant admin consent for Graph permissions.
 - **User Access Administrator** on the target subscription or management group — to assign Reader, Security Reader, and Monitoring Reader.
 - The manual post-apply step also requires permission to grant Monitoring Reader at `/providers/microsoft.aadiam`.
+
+---
+
+# Attack Simulation — Azure Footprint
+
+Separately from the read-only scanner above, the **attack-simulation footprint** is the Entra ID app the Brava runner authenticates *as* to execute simulations and collect telemetry in a subscription. It grants broader, write-capable access (`Contributor`, `Role Based Access Control Administrator`, `Security Reader`, `Monitoring Reader`) at subscription scope.
+
+Two equivalent ways to deploy it — pick one:
+
+| File | Tooling | Use when |
+|---|---|---|
+| `runner_footprint_role_azure.tf` | Terraform | You already manage Azure with Terraform. |
+| `runner_footprint_role_azure.sh` | Azure CLI (`az`) | You don't use Terraform. Same result, no state file. |
+
+Both produce the identical footprint and print the same values to submit to Brava.
+
+## Inputs from Brava (WIF mode)
+
+Find both in **Detections → Settings → Runners** on your Azure runner card:
+
+| Value | Purpose |
+|---|---|
+| Cognito Identity **Pool** ID | Federated credential *audience* |
+| Cognito **Identity** ID | Federated credential *subject* |
+
+## Run — Azure CLI script
+
+Log in first (`az login`). The script is idempotent — safe to re-run.
+
+### Workload Identity Federation (recommended, no secret)
+
+```bash
+./runner_footprint_role_azure.sh \
+  --subscription "<SUBSCRIPTION_NAME_OR_ID>" \
+  --cognito-pool-id "<PROVIDED_BY_BRAVA>" \
+  --cognito-identity-id "<PROVIDED_BY_BRAVA>"
+```
+
+### Client-secret fallback
+
+```bash
+./runner_footprint_role_azure.sh \
+  --subscription "<SUBSCRIPTION_NAME_OR_ID>" \
+  --auth-mode secret
+```
+
+`--subscription` accepts either the subscription display name or its ID. Run `./runner_footprint_role_azure.sh --help` for all options (`--tenant-id`, `--application-name`, `--secret-expiry-years`, `--verbose`).
+
+## After it runs
+
+The script prints the **Tenant ID**, **Client ID**, and **Subscription ID** (plus the **Client Secret** in secret mode). Register them in **Detections → Settings → Runners → Add Azure Footprint** — leave the secret blank when using WIF.
+
+## Minimum permissions for the operator running the script
+
+- **Application Administrator** (or Application Developer) in Entra — to create the app registration and service principal.
+- **Owner** or **User Access Administrator** on the target subscription — to assign the four roles.
