@@ -20,7 +20,9 @@ set -euo pipefail
 #
 # The script is idempotent — re-running it reuses the existing app, service
 # principal, federated credential, and role assignments rather than
-# duplicating them.
+# duplicating them. One exception: in --auth-mode secret each run rotates the
+# client secret (az ad app credential reset), invalidating the previous one —
+# re-register the new secret in Brava after a re-run.
 #
 # When it finishes it prints the three (or four) values you submit to Brava:
 #   Tenant ID, Client ID, Subscription ID [, Client Secret in --auth-mode secret]
@@ -231,6 +233,14 @@ fi
 TENANT_ID="$RESOLVED_TENANT_ID"
 ROLE_SCOPE="/subscriptions/${SUBSCRIPTION_ID}"
 
+# Pin the CLI context to the target subscription. `az ad` (Microsoft Graph)
+# operates against the tenant of the *active* subscription — not against
+# --subscription — so without this the app + service principal could be created
+# in the wrong tenant when the operator's default subscription lives elsewhere
+# (multi-tenant / CSP / guest-access setups). Setting it here keeps both Graph
+# and ARM (role assignments) targeting this subscription's tenant.
+az_run account set --subscription "$SUBSCRIPTION_ID"
+
 echo "  Subscription : $SUBSCRIPTION_DISPLAY ($SUBSCRIPTION_ID)"
 echo "  Tenant       : $TENANT_ID"
 echo "  Auth mode    : $AUTH_MODE"
@@ -247,10 +257,25 @@ else
     echo "  Reusing existing app registration ($APP_ID)."
 fi
 
-# Service principal for the app (find-or-create).
+# Service principal for the app (find-or-create). A just-created app can take a
+# moment to replicate, so `sp create` may briefly fail with "does not reference
+# a valid application object" — retry to ride out that propagation delay.
 SP_OBJECT_ID=$(az ad sp list --filter "appId eq '$APP_ID'" --query "[0].id" -o tsv --only-show-errors)
 if [ -z "$SP_OBJECT_ID" ]; then
-    SP_OBJECT_ID=$(az_run ad sp create --id "$APP_ID" --query id -o tsv)
+    attempt=1 max_attempts=6
+    while :; do
+        if SP_OBJECT_ID=$(az_run ad sp create --id "$APP_ID" --query id -o tsv 2>/dev/null) \
+            && [ -n "$SP_OBJECT_ID" ]; then
+            break
+        fi
+        if [ "$attempt" -ge "$max_attempts" ]; then
+            echo "Error: failed to create service principal for app $APP_ID after $attempt attempts." >&2
+            exit 1
+        fi
+        vlog "service principal not created yet (attempt $attempt/$max_attempts); waiting for app propagation..."
+        sleep 10
+        attempt=$((attempt + 1))
+    done
     echo "  Created service principal ($SP_OBJECT_ID)."
 else
     echo "  Reusing existing service principal ($SP_OBJECT_ID)."
@@ -346,6 +371,8 @@ if [ "$AUTH_MODE" = "secret" ]; then
     echo "  Client Secret    : $CLIENT_SECRET"
     echo
     echo "  Store the client secret now — Azure will not show it again."
+    echo "  Note: re-running this script in secret mode rotates the secret and"
+    echo "  invalidates this one — re-register the new value in Brava if you do."
 else
     echo "  Client Secret    : (none — Workload Identity Federation; leave blank in Brava)"
 fi
