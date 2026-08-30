@@ -106,11 +106,21 @@ resource "google_service_account" "brava_org_reader" {
 
 # Grant the SA read access at the org level.
 # NOTE: roles/viewer is a broad bootstrap grant covering all projects in the org.
-# Replace with a least-privilege custom role scoped to the specific GCP APIs
 # used by scan checks before GA.
 resource "google_organization_iam_member" "brava_org_viewer" {
   org_id = var.gcp_org_id
   role   = "roles/viewer"
+  member = "serviceAccount:${google_service_account.brava_org_reader.email}"
+}
+
+# roles/viewer does not include serviceusage.services.use. For a handful of APIs — Security
+# Command Center, Cloud SQL Admin, Cloud KMS, Cloud Spanner, Identity Toolkit, Access Context
+# Manager, Cloud Bigtable Admin, App Engine Admin, Dataflow, and Organization Policy — GCP checks
+# whether the API is enabled against the project billed for the request (its "quota project"),
+# not necessarily the project being read.
+resource "google_organization_iam_member" "brava_service_usage_consumer" {
+  org_id = var.gcp_org_id
+  role   = "roles/serviceusage.serviceUsageConsumer"
   member = "serviceAccount:${google_service_account.brava_org_reader.email}"
 }
 
