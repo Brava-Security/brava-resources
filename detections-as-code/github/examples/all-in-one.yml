@@ -1,0 +1,206 @@
+# Example 5: all in one, standalone
+# PR gate, nightly regression and on-demand runs in a single file that does not reference the
+# composite action. Pick this when your organization does not allow third-party actions.
+#
+# What it does
+#   pull_request      -> validates the YARA-L rules changed in the PR against the dev SIEM
+#   schedule          -> nightly regression over .brava/regression-rules.txt (catches silent field/value drift)
+#   workflow_dispatch -> validate any rules on demand (e.g. after a parser or collector change)
+#
+# Each rule gets a Brava run:
+#   test    = hygiene checks Q1 routing, Q2 extraction, Q3 normalization, Q6 delivery,
+#             then injects SIMULATION-labelled synthetic telemetry and checks Q4: did the rule fire.
+#             Dev SIEM only (needs the Chronicle events.import / parsers.runParser grant).
+#   dry-run = the same checks without injection (brava run test --dry-run). Read-only, safe on prod.
+#   sweep   = every check a full Brava sweep runs for this rule (incl. duplicate/noisy/SOAR checks and
+#             log-type/feed warnings), then refreshes the rule in the Brava console. Read-only on the SIEM.
+#
+# Setup (one time)
+#   1. Brava console -> Settings -> API Keys: create a key with scopes
+#        hygiene:read  +  hygiene:detections:test
+#      from a dedicated integration user (keys stop working if their creator is removed).
+#   2. Repo secret  BRAVA_API_TOKEN = that key
+#   3. Repo variable BRAVA_SIEM     = the SIEM name shown by `brava siems list` (e.g. "SecOps Dev")
+#   4. Optional repo variable BRAVA_FAIL_ON = critical | high | medium | low | none   (default high)
+#   5. Point RULES_DIR at your rules and replace the "Deploy" step with your existing content-sync step.
+#      Brava validates the LIVE rule in SecOps, so a changed rule must be deployed to dev before it is tested.
+
+name: Brava detection validation
+
+on:
+  pull_request:
+    paths:
+      - "rules/**/*.yaral"
+  schedule:
+    - cron: "0 6 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      rules:
+        description: "Space-separated rule names (YARA-L `rule <name>`). Empty = regression list."
+        required: false
+        default: ""
+      mode:
+        description: "test = checks + synthetic telemetry (dev only). dry-run = checks only. sweep = full per-rule sweep, refreshes the console."
+        type: choice
+        options: [test, dry-run, sweep]
+        default: test
+      siem:
+        description: "SIEM name or id (default: BRAVA_SIEM variable)"
+        required: false
+        default: ""
+
+env:
+  BRAVA_URL: https://console.brava.security
+  BRAVA_API_TOKEN: ${{ secrets.BRAVA_API_TOKEN }}
+  BRAVA_SIEM: ${{ inputs.siem || vars.BRAVA_SIEM }}
+  MODE: ${{ inputs.mode || 'test' }}
+  FAIL_ON: ${{ vars.BRAVA_FAIL_ON || 'high' }}
+  RULES_DIR: rules
+  REGRESSION_LIST: .brava/regression-rules.txt
+  # "true" also fails the job on exit 4 (inconclusive / not telemetry-driven). Default: warn only.
+  STRICT: ${{ vars.BRAVA_STRICT || 'false' }}
+
+# Brava runs one sweep/test at a time per SIEM. Queue workflow runs rather than colliding on HTTP 409.
+concurrency:
+  group: brava-${{ inputs.siem || vars.BRAVA_SIEM }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: ${{ inputs.mode || 'test' }} on ${{ inputs.siem || vars.BRAVA_SIEM }}
+    runs-on: ubuntu-latest
+    # A test holds the SIEM slot for up to 45m (injection landing alone can take ~30m); size for your list.
+    timeout-minutes: 330
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Deploy changed rules to SecOps dev
+        if: github.event_name == 'pull_request'
+        run: ./scripts/deploy-rules.sh dev   # <-- replace with your content-sync step
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Brava CLI
+        run: |
+          pip install --quiet brava-cli
+          brava doctor
+
+      - name: Resolve rules to validate
+        id: rules
+        env:
+          INPUT_RULES: ${{ inputs.rules }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          # YARA-L rule name == SecOps display name. One "name<TAB>file" per line.
+          rule_name() { grep -m1 -oE '^[[:space:]]*rule[[:space:]]+[A-Za-z0-9_]+' "$1" | awk '{print $2}'; }
+          rule_file() { grep -rlE "^[[:space:]]*rule[[:space:]]+$1([[:space:]]|\{|$)" "$RULES_DIR" | head -n1; }
+
+          : > rules.tsv
+          if [ -n "$INPUT_RULES" ]; then
+            for r in $INPUT_RULES; do printf '%s\t%s\n' "$r" "$(rule_file "$r")" >> rules.tsv; done
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
+            git diff --name-only --diff-filter=d "$BASE_SHA" "${{ github.sha }}" -- "$RULES_DIR/**/*.yaral" "$RULES_DIR/*.yaral" \
+              | while read -r f; do n=$(rule_name "$f"); [ -n "$n" ] && printf '%s\t%s\n' "$n" "$f"; done >> rules.tsv
+          else
+            [ -f "$REGRESSION_LIST" ] || { echo "::error::$REGRESSION_LIST not found"; exit 1; }
+            grep -vE '^\s*(#|$)' "$REGRESSION_LIST" | while read -r r; do printf '%s\t%s\n' "$r" "$(rule_file "$r")"; done >> rules.tsv
+          fi
+
+          echo "count=$(wc -l < rules.tsv | tr -d ' ')" >> "$GITHUB_OUTPUT"
+          echo "Rules to validate:"; cat rules.tsv
+
+      - name: Validate rules
+        if: steps.rules.outputs.count != '0'
+        run: |
+          set -uo pipefail
+          kind=$MODE; extra=""
+          if [ "$MODE" = dry-run ]; then kind=test; extra="--dry-run"; fi
+          mkdir -p brava-results
+          summary=brava-results/summary.md
+          {
+            echo "## Brava detection validation: \`$MODE\` on \`$BRAVA_SIEM\`"
+            echo
+            echo "| Rule | Verdict | Checks | Findings (>= $FAIL_ON fail) | Result |"
+            echo "|---|---|---|---|---|"
+          } > "$summary"
+
+          failed=0
+          while IFS=$'\t' read -r rule file; do
+            echo "::group::$MODE $rule"
+            out="brava-results/$MODE-$rule.json"
+            loc=""; [ -n "$file" ] && loc="file=$file,"
+
+            if ! id=$(brava run "$kind" create $extra --siem "$BRAVA_SIEM" --rule "$rule" --json | jq -er .id); then
+              echo "::error ${loc}title=Brava $MODE::$rule: could not start (unknown rule, SIEM busy past timeout, or auth)"
+              echo "| \`$rule\` | | | | :x: could not start |" >> "$summary"; failed=1
+              echo "::endgroup::"; continue
+            fi
+
+            brava run "$kind" watch "$id" --fail-on "$FAIL_ON" --json > "$out"; rc=$?
+
+            verdict="n/a"; checks=""; findings=""; console=""
+            if jq -e . "$out" >/dev/null 2>&1; then
+              verdict=$(jq -r '.verdict + (if .inconclusiveReason then "/" + .inconclusiveReason else "" end)' "$out")
+              checks=$(jq -r '[.checks[] | (.question | split("_")[0]) + " " + ({PASS:"✓",FAIL:"✗",NOT_RUN:"–"}[.status] // .status)] | join("  ")' "$out")
+              findings=$(jq -r '([.findings[] | .severity + ": " + .title] + [.sourceWarnings[]? | "warning " + .severity + ": " + .title]) | join("<br>")' "$out")
+              console=$(jq -r '.consoleUpdate // empty' "$out")
+            fi
+
+            case $rc in
+              0) res=":white_check_mark: pass" ;;
+              2) res=":x: fail"; failed=1
+                 echo "::error ${loc}title=Brava $MODE::$rule: $verdict. $(jq -r '[.checks[] | select(.status=="FAIL") | .question + ": " + .detail] + [.findings[] | .severity + ": " + .title + " — " + .suggestedFix] | join(" | ")' "$out" 2>/dev/null)" ;;
+              3) res=":hourglass: timed out (run $id continues server-side)"; failed=1
+                 echo "::error ${loc}title=Brava $MODE::$rule: watch timed out. Resume: brava run $kind watch $id" ;;
+              4) res=":grey_question: no answer"
+                 echo "::warning ${loc}title=Brava $MODE::$rule: no answer ($verdict). See docs.brava.security/hygiene/detection-testing/#verdict-states"
+                 [ "$STRICT" = "true" ] && { res="$res (strict)"; failed=1; } ;;
+              *) res=":x: error (exit $rc)"; failed=1
+                 echo "::error ${loc}title=Brava $MODE::$rule: request/auth/validation error" ;;
+            esac
+            case ${console:-} in
+              ""|UPDATED) ;;
+              *) res="$res (console not updated: $console)"
+                 echo "::warning ${loc}title=Brava $MODE::$rule: console not updated ($console); run the sweep again after the full sweep completes" ;;
+            esac
+            echo "| \`$rule\` | $verdict | $checks | $findings | $res |" >> "$summary"
+            echo "::endgroup::"
+          done < rules.tsv
+
+          echo >> "$summary"
+          echo "Full JSON per rule is attached as the \`brava-results\` artifact. Verdicts: https://docs.brava.security/hygiene/detection-testing/#verdict-states" >> "$summary"
+          cat "$summary" >> "$GITHUB_STEP_SUMMARY"
+          exit $failed
+
+      - name: Upload results
+        if: always() && steps.rules.outputs.count != '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: brava-results
+          path: brava-results/
+
+      - name: Comment on PR
+        if: always() && github.event_name == 'pull_request' && steps.rules.outputs.count != '0'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- brava-detection-validation -->';
+            const body = marker + '\n' + fs.readFileSync('brava-results/summary.md', 'utf8');
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.rest.issues.listComments({ owner, repo, issue_number, per_page: 100 });
+            const existing = comments.data.find(c => c.body && c.body.startsWith(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }

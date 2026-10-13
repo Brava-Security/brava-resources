@@ -1,0 +1,56 @@
+# Example 4: on demand
+# Run any mode on any rules against any SIEM from the Actions tab. Useful after a parser
+# extension, feed or collector change, or to re-check a rule someone is investigating.
+#
+# Needs: secret BRAVA_API_TOKEN. The SIEM name comes from the form.
+
+name: Brava on demand
+
+on:
+  workflow_dispatch:
+    inputs:
+      rules:
+        description: "Rule names, space-separated (the YARA-L `rule <name>`)"
+        required: true
+      siem:
+        description: "SIEM name or id (brava siems list)"
+        required: true
+      mode:
+        description: "test = checks + synthetic telemetry (dev only). dry-run = checks only. sweep = full one-rule sweep, refreshes the console."
+        type: choice
+        options: [test, dry-run, sweep]
+        default: dry-run
+      fail-on:
+        description: "Lowest finding severity that fails"
+        type: choice
+        options: [critical, high, medium, low, none]
+        default: high
+
+concurrency:
+  group: brava-${{ inputs.siem }}-${{ inputs.mode }}
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    permissions:
+      contents: read
+    name: ${{ inputs.mode }} on ${{ inputs.siem }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: Brava-Security/brava-resources/detections-as-code/github/action@main
+        with:
+          api-token: ${{ secrets.BRAVA_API_TOKEN }}
+          siem: ${{ inputs.siem }}
+          rules: ${{ inputs.rules }}
+          mode: ${{ inputs.mode }}
+          fail-on: ${{ inputs.fail-on }}
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: brava-${{ inputs.mode }}-${{ github.run_id }}
+          path: brava-results/

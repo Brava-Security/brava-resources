@@ -1,0 +1,85 @@
+# Example 1: PR gate
+# A changed rule must fire in the dev SecOps instance before it can be merged.
+#
+# Needs: secret BRAVA_API_TOKEN, variable BRAVA_SIEM_DEV (name from `brava siems list`).
+# Replace the "Deploy" step with your content-sync command: Brava validates the live rule,
+# so the changed rule must be deployed to dev before it is tested.
+# Pin the action to a tag or commit instead of @main once you adopt it.
+
+name: Brava PR gate
+
+on:
+  pull_request:
+    paths:
+      - "rules/**/*.yaral"
+
+# One injection test at a time per SIEM: queue PRs instead of colliding.
+concurrency:
+  group: brava-${{ vars.BRAVA_SIEM_DEV }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Deploy changed rules to SecOps dev
+        run: ./scripts/deploy-rules.sh dev   # <-- your existing content-sync step
+
+      - name: Rules changed in this PR
+        id: changed
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # The SecOps display name is the YARA-L `rule <name>`. Deleted rules are skipped.
+          rules=$(git diff --name-only --diff-filter=d "$BASE" "$HEAD" -- rules \
+            | grep -E '\.yaral$' \
+            | xargs -r grep -m1 -hoE '^[[:space:]]*rule[[:space:]]+[A-Za-z0-9_]+' \
+            | awk '{print $2}' | sort -u | tr '\n' ' ')
+          echo "rules=$rules" >> "$GITHUB_OUTPUT"
+          echo "Changed rules: ${rules:-none}"
+
+      - name: Validate with synthetic telemetry
+        id: brava
+        if: steps.changed.outputs.rules != ''
+        uses: Brava-Security/brava-resources/detections-as-code/github/action@main
+        with:
+          api-token: ${{ secrets.BRAVA_API_TOKEN }}
+          siem: ${{ vars.BRAVA_SIEM_DEV }}
+          rules: ${{ steps.changed.outputs.rules }}
+          mode: test
+          fail-on: high
+
+      - name: Upload results
+        if: always() && steps.changed.outputs.rules != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: brava-results
+          path: brava-results/
+
+      - name: Comment on the PR
+        if: always() && steps.changed.outputs.rules != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- brava-detection-validation -->';
+            const body = marker + '\n' + fs.readFileSync('brava-results/summary.md', 'utf8');
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.rest.issues.listComments({ owner, repo, issue_number, per_page: 100 });
+            const existing = comments.data.find(c => c.body && c.body.startsWith(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }

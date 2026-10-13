@@ -1,0 +1,70 @@
+# Example 2: nightly drift regression
+# Re-test a curated list of rules every night in dev, so a rule that silently stops firing
+# because a parser, field name or expected value changed is caught the next morning.
+#
+# Needs: secret BRAVA_API_TOKEN, variable BRAVA_SIEM_DEV, and .brava/regression-rules.txt
+# (one rule name per line, # comments allowed). Swap the last step for your own notification.
+
+name: Brava nightly regression
+
+on:
+  schedule:
+    - cron: "0 6 * * 1-5"   # weekdays 06:00 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: brava-${{ vars.BRAVA_SIEM_DEV }}
+  cancel-in-progress: false
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    # Each injection test can hold the SIEM for up to 45 minutes while events land; size for your list.
+    timeout-minutes: 330
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read the regression list
+        id: list
+        run: |
+          set -euo pipefail
+          rules=$(grep -vE '^\s*(#|$)' .brava/regression-rules.txt | tr '\n' ' ')
+          echo "rules=$rules" >> "$GITHUB_OUTPUT"
+
+      - name: Test every rule on the list
+        id: brava
+        uses: Brava-Security/brava-resources/detections-as-code/github/action@main
+        with:
+          api-token: ${{ secrets.BRAVA_API_TOKEN }}
+          siem: ${{ vars.BRAVA_SIEM_DEV }}
+          rules: ${{ steps.list.outputs.rules }}
+          mode: test
+          strict: "false"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: brava-nightly-${{ github.run_id }}
+          path: brava-results/
+
+      # Example notification: open a tracking issue, or add to the open one, when something failed.
+      - name: Track failures in an issue
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const summary = fs.readFileSync('brava-results/summary.md', 'utf8');
+            const { owner, repo } = context.repo;
+            const title = 'Brava nightly regression: detections failed';
+            const open = await github.rest.issues.listForRepo({ owner, repo, state: 'open', labels: 'brava-regression' });
+            const body = `Run: ${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}\n\n${summary}`;
+            if (open.data.length) {
+              await github.rest.issues.createComment({ owner, repo, issue_number: open.data[0].number, body });
+            } else {
+              await github.rest.issues.create({ owner, repo, title, body, labels: ['brava-regression'] });
+            }
