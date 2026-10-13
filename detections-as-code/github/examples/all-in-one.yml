@@ -1,6 +1,6 @@
 # Example 5: all in one, standalone
 # PR gate, nightly regression and on-demand runs in a single file that does not reference the
-# composite action. Pick this when your organisation does not allow third-party actions.
+# composite action. Pick this when your organization does not allow third-party actions.
 #
 # What it does
 #   pull_request      -> validates the YARA-L rules changed in the PR against the dev SIEM
