@@ -1,0 +1,158 @@
+name: Brava detection validation
+description: >-
+  Validate Google SecOps detection rules with the Brava CLI: a read-only sweep, a dry-run of the
+  hygiene checks, or a synthetic-telemetry test that proves the rule fires. Writes a job summary,
+  annotations on the rule files and a results directory, and fails the step when a rule fails.
+author: Brava Security
+
+inputs:
+  api-token:
+    description: Brava API key with scopes hygiene:read and hygiene:detections:test
+    required: true
+  siem:
+    description: SIEM name or id, exactly as `brava siems list` prints it
+    required: true
+  rules:
+    description: Rule names to validate (the YARA-L `rule <name>`), separated by spaces or newlines
+    required: true
+  mode:
+    description: "test (checks + synthetic telemetry, dev SIEM only), dry-run (checks only, read-only) or sweep (full one-rule sweep, refreshes the console)"
+    required: false
+    default: test
+  fail-on:
+    description: "Lowest finding severity that fails: critical, high, medium, low or none"
+    required: false
+    default: high
+  strict:
+    description: "true also fails on exit 4 (inconclusive or not telemetry-driven). Default warns only."
+    required: false
+    default: "false"
+  url:
+    description: Brava console URL
+    required: false
+    default: https://console.brava.security
+  rules-dir:
+    description: Directory searched for the rule's file so failures annotate the right file in the PR
+    required: false
+    default: rules
+  results-dir:
+    description: Where to write summary.md and one JSON file per rule
+    required: false
+    default: brava-results
+  cli-version:
+    description: Pin brava-cli to a version (for example 0.3.0). Empty installs the latest.
+    required: false
+    default: ""
+  python-version:
+    description: Python version for the CLI (3.10 or later)
+    required: false
+    default: "3.12"
+
+outputs:
+  failed:
+    description: "1 when at least one rule failed, otherwise 0"
+    value: ${{ steps.validate.outputs.failed }}
+  summary:
+    description: Path to the Markdown summary (one row per rule), for a PR comment or a notification
+    value: ${{ steps.validate.outputs.summary }}
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Install Brava CLI
+      shell: bash
+      env:
+        BRAVA_API_TOKEN: ${{ inputs.api-token }}
+        BRAVA_URL: ${{ inputs.url }}
+        CLI_VERSION: ${{ inputs.cli-version }}
+      run: |
+        set -euo pipefail
+        pip install --quiet "brava-cli${CLI_VERSION:+==$CLI_VERSION}"
+        brava doctor
+
+    - name: Validate rules
+      id: validate
+      shell: bash
+      env:
+        BRAVA_API_TOKEN: ${{ inputs.api-token }}
+        BRAVA_URL: ${{ inputs.url }}
+        BRAVA_SIEM: ${{ inputs.siem }}
+        RULES: ${{ inputs.rules }}
+        MODE: ${{ inputs.mode }}
+        FAIL_ON: ${{ inputs.fail-on }}
+        STRICT: ${{ inputs.strict }}
+        RULES_DIR: ${{ inputs.rules-dir }}
+        RESULTS_DIR: ${{ inputs.results-dir }}
+      run: |
+        set -uo pipefail
+        kind=$MODE; extra=""
+        case "$MODE" in
+          test) ;;
+          dry-run) kind=test; extra="--dry-run" ;;
+          sweep) ;;
+          *) echo "::error::mode must be test, dry-run or sweep (got '$MODE')"; exit 1 ;;
+        esac
+        rule_file() { grep -rlE "^[[:space:]]*rule[[:space:]]+$1([[:space:]]|\{|$)" "$RULES_DIR" 2>/dev/null | head -n1; }
+
+        mkdir -p "$RESULTS_DIR"
+        summary="$RESULTS_DIR/summary.md"
+        {
+          echo "## Brava detection validation: \`$MODE\` on \`$BRAVA_SIEM\`"
+          echo
+          echo "| Rule | Verdict | Checks | Findings (>= $FAIL_ON fail) | Result |"
+          echo "|---|---|---|---|---|"
+        } > "$summary"
+
+        failed=0
+        for rule in $RULES; do
+          echo "::group::$MODE $rule"
+          out="$RESULTS_DIR/$MODE-$rule.json"
+          file=$(rule_file "$rule"); loc=""; [ -n "$file" ] && loc="file=$file,"
+
+          if ! id=$(brava run "$kind" create $extra --siem "$BRAVA_SIEM" --rule "$rule" --json | jq -er .id); then
+            echo "::error ${loc}title=Brava $MODE::$rule: could not start (unknown rule, SIEM busy past timeout, or auth)"
+            echo "| \`$rule\` | | | | :x: could not start |" >> "$summary"; failed=1
+            echo "::endgroup::"; continue
+          fi
+
+          brava run "$kind" watch "$id" --fail-on "$FAIL_ON" --json > "$out"; rc=$?
+
+          verdict="n/a"; checks=""; findings=""; console=""
+          if jq -e . "$out" >/dev/null 2>&1; then
+            verdict=$(jq -r '.verdict + (if .inconclusiveReason then "/" + .inconclusiveReason else "" end)' "$out")
+            checks=$(jq -r '[.checks[] | (.question | split("_")[0]) + " " + ({PASS:"✓",FAIL:"✗",NOT_RUN:"–"}[.status] // .status)] | join("  ")' "$out")
+            findings=$(jq -r '([.findings[] | .severity + ": " + .title] + [.sourceWarnings[]? | "warning " + .severity + ": " + .title]) | join("<br>")' "$out")
+            console=$(jq -r '.consoleUpdate // empty' "$out")
+          fi
+
+          case $rc in
+            0) res=":white_check_mark: pass" ;;
+            2) res=":x: fail"; failed=1
+               echo "::error ${loc}title=Brava $MODE::$rule: $verdict. $(jq -r '[.checks[] | select(.status=="FAIL") | .question + ": " + .detail] + [.findings[] | .severity + ": " + .title + " — " + .suggestedFix] | join(" | ")' "$out" 2>/dev/null)" ;;
+            3) res=":hourglass: timed out (run $id continues server-side)"; failed=1
+               echo "::error ${loc}title=Brava $MODE::$rule: watch timed out. Resume: brava run $kind watch $id" ;;
+            4) res=":grey_question: no answer"
+               echo "::warning ${loc}title=Brava $MODE::$rule: no answer ($verdict). See https://docs.brava.security/hygiene/detection-testing/#verdict-states"
+               [ "$STRICT" = "true" ] && { res="$res (strict)"; failed=1; } ;;
+            *) res=":x: error (exit $rc)"; failed=1
+               echo "::error ${loc}title=Brava $MODE::$rule: request, auth or validation error" ;;
+          esac
+          case ${console:-} in
+            ""|UPDATED) ;;
+            *) res="$res (console not updated: $console)"
+               echo "::warning ${loc}title=Brava $MODE::$rule: console not updated ($console); run the sweep again after the full sweep completes" ;;
+          esac
+          echo "| \`$rule\` | $verdict | $checks | $findings | $res |" >> "$summary"
+          echo "::endgroup::"
+        done
+
+        echo >> "$summary"
+        echo "Full JSON per rule is in the \`$RESULTS_DIR\` directory. Verdicts: https://docs.brava.security/hygiene/detection-testing/#verdict-states" >> "$summary"
+        cat "$summary" >> "$GITHUB_STEP_SUMMARY"
+        echo "failed=$failed" >> "$GITHUB_OUTPUT"
+        echo "summary=$summary" >> "$GITHUB_OUTPUT"
+        exit $failed

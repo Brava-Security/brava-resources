@@ -1,0 +1,81 @@
+# Example 3: post-deploy sweep on every production SIEM
+# After a merge to main deploys rules to production, run a read-only Brava sweep of each changed
+# rule on each production SecOps instance: it compiles, has a data source, its fields are populated,
+# it is enabled and alerting, it is not a duplicate or noisy rule, and the feeds it depends on are
+# healthy. The rule's row in the Brava console refreshes immediately. Nothing is injected, so
+# read-only SIEM permissions are enough.
+#
+# Needs: secret BRAVA_API_TOKEN and variable BRAVA_SIEMS_PROD as a JSON array of SIEM names,
+# for example ["SecOps Prod", "SecOps Prod Region 2"].
+
+name: Brava post-deploy sweep
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "rules/**/*.yaral"
+
+jobs:
+  changed:
+    runs-on: ubuntu-latest
+    outputs:
+      rules: ${{ steps.changed.outputs.rules }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Deploy changed rules to production
+        run: ./scripts/deploy-rules.sh prod   # <-- your existing content-sync step
+
+      - name: Rules changed in this push
+        id: changed
+        env:
+          BEFORE: ${{ github.event.before }}
+          HEAD: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          base="$BEFORE"
+          # No usable "before" commit on a branch's first push or after a force-push.
+          git cat-file -e "$base^{commit}" 2>/dev/null || base=HEAD~1
+          rules=$(git diff --name-only --diff-filter=d "$base" "$HEAD" -- rules \
+            | grep -E '\.yaral$' \
+            | xargs -r grep -m1 -hoE '^[[:space:]]*rule[[:space:]]+[A-Za-z0-9_]+' \
+            | awk '{print $2}' | sort -u | tr '\n' ' ')
+          echo "rules=$rules" >> "$GITHUB_OUTPUT"
+
+  sweep:
+    needs: changed
+    if: needs.changed.outputs.rules != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        siem: ${{ fromJSON(vars.BRAVA_SIEMS_PROD) }}
+    # One sweep at a time per SIEM; SIEMs run in parallel.
+    concurrency:
+      group: brava-sweep-${{ matrix.siem }}
+      cancel-in-progress: false
+    name: sweep on ${{ matrix.siem }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: Brava-Security/brava-resources/detections-as-code/github/action@main
+        with:
+          api-token: ${{ secrets.BRAVA_API_TOKEN }}
+          siem: ${{ matrix.siem }}
+          rules: ${{ needs.changed.outputs.rules }}
+          mode: sweep
+          fail-on: high
+          results-dir: brava-results/${{ matrix.siem }}
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: brava-sweep-${{ strategy.job-index }}
+          path: brava-results/
