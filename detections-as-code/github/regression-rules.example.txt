@@ -1,0 +1,6 @@
+# One Google SecOps rule name per line (the YARA-L `rule <name>`). Lines starting with # are ignored.
+# Copy to .brava/regression-rules.txt in your detections repo. These run nightly against the dev SIEM
+# to catch rules that silently stop firing after parser, field-name or expected-value drift.
+# Start with your highest-severity rules, then add any rule that has silently broken before.
+# mimikatz_credential_dumping
+# phishing_click_then_mailbox_rule_tampering
