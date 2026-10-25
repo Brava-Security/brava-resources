@@ -64,8 +64,8 @@ VERSION="${BRAVA_VERSION:-latest}"
 BASE_URL="${BRAVA_RELEASES_URL:-https://github.com/Brava-Security/brava-resources/releases}"
 if [[ "$VERSION" == "latest" ]]; then
     DOWNLOAD_URL="${BASE_URL}/latest/download/install-linux-${ARCH}.sh"
+else
     DOWNLOAD_URL="${BASE_URL}/download/collector-v${VERSION#v}/install-linux-${ARCH}.sh"
-    DOWNLOAD_URL="${BASE_URL}/download/collector-${VERSION}/install-linux-${ARCH}.sh"
 fi
 INSTALLER_PATH="/tmp/brava-install-$$.sh"
 
