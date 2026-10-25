@@ -12,7 +12,7 @@
 #   curl -sSL https://github.com/Brava-Security/brava-resources/releases/latest/download/install.sh | sudo bash
 #
 # To install a specific version:
-#   BRAVA_VERSION=v1.0.0 curl -sSL https://github.com/Brava-Security/brava-resources/releases/latest/download/install.sh | sudo bash
+#   BRAVA_VERSION=v1.11.0 curl -sSL https://github.com/Brava-Security/brava-resources/releases/latest/download/install.sh | sudo bash
 #
 # Environment variables (optional):
 #   BRAVA_VERSION       - Version to install (default: latest)
@@ -64,7 +64,7 @@ VERSION="${BRAVA_VERSION:-latest}"
 BASE_URL="${BRAVA_RELEASES_URL:-https://github.com/Brava-Security/brava-resources/releases}"
 if [[ "$VERSION" == "latest" ]]; then
     DOWNLOAD_URL="${BASE_URL}/latest/download/install-linux-${ARCH}.sh"
-else
+    DOWNLOAD_URL="${BASE_URL}/download/collector-v${VERSION#v}/install-linux-${ARCH}.sh"
     DOWNLOAD_URL="${BASE_URL}/download/collector-${VERSION}/install-linux-${ARCH}.sh"
 fi
 INSTALLER_PATH="/tmp/brava-install-$$.sh"
