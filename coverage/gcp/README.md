@@ -139,7 +139,7 @@ Run `terraform output` and register the footprint in **Detections â†’ Settings â
 
 ## Offline validation
 
-Because `coverage/gcp/` stores multiple standalone single-file root modules side-by-side, run `terraform test` in a clean staging directory:
+Offline `terraform test` uses `mock_provider "google" {}` and requires Terraform `>= 1.7` (customer `terraform apply` requires `>= 1.5`). Because `coverage/gcp/` stores multiple standalone single-file root modules side-by-side, run `terraform test` in a clean staging directory:
 
 ```bash
 TMP_DIR=$(mktemp -d) && cp coverage/gcp/runner_footprint_role_gcp.tf "$TMP_DIR/" && cp -R coverage/gcp/tests "$TMP_DIR/tests" && terraform -chdir="$TMP_DIR" init -backend=false && terraform -chdir="$TMP_DIR" test && rm -rf "$TMP_DIR"
