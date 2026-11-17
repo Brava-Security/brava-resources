@@ -63,8 +63,11 @@ locals {
     startswith(trimspace(f), "folders/") ? trimspace(f) : "folders/${trimspace(f)}"
   ])
 
-  effective_api_projects = length(var.target_project_ids) > 0 ? var.target_project_ids : toset([var.project_id])
-  project_iam_targets    = length(local.normalized_folder_ids) > 0 ? toset([]) : local.effective_api_projects
+  effective_api_projects         = length(var.target_project_ids) > 0 ? var.target_project_ids : toset([var.project_id])
+  additional_api_projects        = setsubtract(local.effective_api_projects, toset([var.project_id]))
+  project_iam_targets            = length(local.normalized_folder_ids) > 0 ? toset([]) : local.effective_api_projects
+  host_project_iam_count         = contains(local.project_iam_targets, var.project_id) ? 1 : 0
+  additional_project_iam_targets = setsubtract(local.project_iam_targets, toset([var.project_id]))
 
   folder_role_bindings = {
     for pair in setproduct(local.normalized_folder_ids, local.simulation_folder_roles) :
@@ -75,7 +78,7 @@ locals {
   }
 
   project_role_bindings = {
-    for pair in setproduct(local.project_iam_targets, local.simulation_project_roles) :
+    for pair in setproduct(local.additional_project_iam_targets, local.simulation_project_roles) :
     "${pair[0]}::${pair[1]}" => {
       project = pair[0]
       role    = pair[1]
@@ -86,7 +89,19 @@ locals {
 # disable_on_destroy = false keeps SCC enabled if `terraform destroy` runs so
 # unrelated SCC consumers in enrolled projects are unaffected.
 resource "google_project_service" "securitycenter" {
-  for_each           = local.effective_api_projects
+  count              = contains(local.effective_api_projects, var.project_id) ? 1 : 0
+  project            = var.project_id
+  service            = "securitycenter.googleapis.com"
+  disable_on_destroy = false
+}
+
+moved {
+  from = google_project_service.securitycenter
+  to   = google_project_service.securitycenter[0]
+}
+
+resource "google_project_service" "additional_securitycenter" {
+  for_each           = local.additional_api_projects
   project            = each.value
   service            = "securitycenter.googleapis.com"
   disable_on_destroy = false
@@ -103,6 +118,80 @@ resource "google_service_account_iam_binding" "brava_runner_can_impersonate_foot
   service_account_id = google_service_account.footprint.name
   role               = "roles/iam.serviceAccountTokenCreator"
   members            = ["serviceAccount:${var.brava_runner_sa_email}"]
+}
+
+# Preserve original single-project resource addresses via count + moved blocks
+# so existing single-project Terraform states upgrade with zero IAM churn.
+resource "google_project_iam_member" "editor" {
+  count   = local.host_project_iam_count
+  project = var.project_id
+  role    = "roles/editor"
+  member  = "serviceAccount:${google_service_account.footprint.email}"
+}
+
+moved {
+  from = google_project_iam_member.editor
+  to   = google_project_iam_member.editor[0]
+}
+
+resource "google_project_iam_member" "service_account_admin" {
+  count   = local.host_project_iam_count
+  project = var.project_id
+  role    = "roles/iam.serviceAccountAdmin"
+  member  = "serviceAccount:${google_service_account.footprint.email}"
+}
+
+moved {
+  from = google_project_iam_member.service_account_admin
+  to   = google_project_iam_member.service_account_admin[0]
+}
+
+resource "google_project_iam_member" "project_iam_admin" {
+  count   = local.host_project_iam_count
+  project = var.project_id
+  role    = "roles/resourcemanager.projectIamAdmin"
+  member  = "serviceAccount:${google_service_account.footprint.email}"
+}
+
+moved {
+  from = google_project_iam_member.project_iam_admin
+  to   = google_project_iam_member.project_iam_admin[0]
+}
+
+resource "google_project_iam_member" "service_account_key_admin" {
+  count   = local.host_project_iam_count
+  project = var.project_id
+  role    = "roles/iam.serviceAccountKeyAdmin"
+  member  = "serviceAccount:${google_service_account.footprint.email}"
+}
+
+moved {
+  from = google_project_iam_member.service_account_key_admin
+  to   = google_project_iam_member.service_account_key_admin[0]
+}
+
+resource "google_project_iam_member" "secret_manager_admin" {
+  count   = local.host_project_iam_count
+  project = var.project_id
+  role    = "roles/secretmanager.admin"
+  member  = "serviceAccount:${google_service_account.footprint.email}"
+}
+
+moved {
+  from = google_project_iam_member.secret_manager_admin
+  to   = google_project_iam_member.secret_manager_admin[0]
+}
+
+resource "google_project_iam_member" "service_usage_admin" {
+  count   = local.host_project_iam_count
+  project = var.project_id
+  role    = "roles/serviceusage.serviceUsageAdmin"
+  member  = "serviceAccount:${google_service_account.footprint.email}"
+}
+
+moved {
+  from = google_project_iam_member.service_usage_admin
+  to   = google_project_iam_member.service_usage_admin[0]
 }
 
 resource "google_folder_iam_member" "simulation_roles" {

@@ -132,6 +132,11 @@ Run `terraform output` and register the footprint in **Detections → Settings �
 - **Target projects (`target_project_ids` or `project_id`)** — `roles/serviceusage.serviceUsageAdmin` to enable `securitycenter.googleapis.com`, plus `roles/resourcemanager.projectIamAdmin` when `folder_ids` is empty.
 - **Target folders (`folder_ids`)** — `roles/resourcemanager.folderIamAdmin` on each enrolled non-prod folder.
 
+## Upgrading Existing Single-Project Deployments
+
+- **Staying single-project or adding `target_project_ids`:** Built-in `moved` blocks migrate existing `google_project_service.securitycenter` and the six `google_project_iam_member.*` state addresses in-place to `[0]` with zero IAM destroys/recreates. Including `project_id` in `target_project_ids` keeps `project_id` on `[0]` and adds bindings only for the new projects.
+- **Migrating an existing single-project state to `folder_ids`:** Setting `folder_ids` grants folder-level IAM inheritance and removes the redundant project-level bindings on `project_id`. Ensure `project_id` is already inside an enrolled folder before applying; if GCP IAM eventual consistency briefly delays folder propagation, re-run `terraform apply` (or verify inherited bindings with `gcloud projects get-ancestors-iam-policy`).
+
 ## Offline validation
 
 Because `coverage/gcp/` stores multiple standalone single-file root modules side-by-side, run `terraform test` in a clean staging directory:
