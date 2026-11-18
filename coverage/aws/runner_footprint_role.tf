@@ -99,6 +99,7 @@ resource "aws_iam_role_policy" "footprint" {
           "ecs:*",
           "rds:*",
           "lambda:*",
+          "events:*",
           "logs:*",
           "cloudwatch:*",
           "cloudtrail:*",
