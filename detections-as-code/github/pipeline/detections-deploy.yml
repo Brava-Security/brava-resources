@@ -1,0 +1,140 @@
+# Stages 2 to 4 of https://docs.brava.security/hygiene/detection-as-code/
+# Copy to .github/workflows/ and change the items listed under "Complete GitHub Actions example".
+name: detections-deploy
+on:
+  push:
+    branches: [main]
+    paths: ["rules/**.yaral"]
+
+permissions:
+  contents: read
+  id-token: write   # for Workload Identity Federation
+
+env:
+  BRAVA_API_TOKEN: ${{ secrets.BRAVA_API_TOKEN }}
+  BRAVA_URL: https://console.brava.security
+
+jobs:
+  dev:
+    runs-on: ubuntu-latest
+    outputs:
+      rules: ${{ steps.changed.outputs.rules }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.SECOPS_DEPLOY_SA }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install "brava-cli==0.4.0" "secops==0.44.1"
+      - run: brava doctor
+      - id: changed
+        name: List changed rules
+        run: |
+          base="${{ github.event.before }}"
+          # No usable "before" commit on a branch's first push or after a force-push.
+          git cat-file -e "$base^{commit}" 2>/dev/null || base=HEAD~1
+          files=$(git diff --name-only --diff-filter=AM "$base" "${{ github.sha }}" -- 'rules/*.yaral' | tr '\n' ' ')
+          echo "rules=$files" >> "$GITHUB_OUTPUT"
+      - name: Deploy to Dev and verify
+        env:
+          CUSTOMER_ID: ${{ vars.DEV_CUSTOMER_ID }}
+          PROJECT: ${{ vars.DEV_PROJECT }}
+          REGION: ${{ vars.DEV_REGION }}
+          FILES: ${{ steps.changed.outputs.rules }}
+          BRAVA_TEST_GATE: ${{ vars.BRAVA_TEST_GATE || 'warn' }}
+        run: |
+          set -euo pipefail
+          sx() { secops --customer-id "$CUSTOMER_ID" --project-id "$PROJECT" --region "$REGION" "$@"; }
+          blocked=0
+          {
+            echo "### Brava detection tests (gate: $BRAVA_TEST_GATE)"
+            echo "| Rule | Result |"
+            echo "|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for file in $FILES; do
+            name=$(sed -nE 's/^[[:space:]]*rule[[:space:]]+([A-Za-z_][A-Za-z0-9_]*).*/\1/p' "$file" | head -n1)
+            ids=$(sx rule list --view BASIC --as-list \
+              | jq -r --arg n "$name" '.[] | select(.displayName == $n) | .name | split("/") | last')
+            if [ "$(printf '%s' "$ids" | grep -c .)" -gt 1 ]; then
+              echo "::error file=$file::'$name' matches several rules in Dev: $(echo $ids). Archive or rename the extra ones, or deploy it with an explicit ID."
+              exit 1
+            fi
+            rule_id=$ids
+            if [ -z "$rule_id" ]; then
+              rule_id=$(sx rule create --file "$file" | jq -er '.name | split("/") | last')
+            else
+              sx rule update --id "$rule_id" --file "$file" > /dev/null
+            fi
+            sx rule update-deployment --id "$rule_id" --enabled true --alerting false > /dev/null
+            echo "::group::Verify $name ($rule_id)"
+            rc=0
+            if id=$(brava run test create --siem "SecOps Dev" --rule "$rule_id" --json | jq -er .id); then
+              brava run test watch "$id" --fail-on high || rc=$?
+            else
+              rc=1
+            fi
+            echo "::endgroup::"
+            case "$rc" in
+              0) result="passed" ;;
+              2) result="did not pass: the rule did not fire, a check failed, or a finding reached --fail-on" ;;
+              4) result="no answer: inconclusive or not telemetry-driven" ;;
+              3) result="timed out" ;;
+              *) result="could not run (exit $rc)" ;;
+            esac
+            echo "| \`$name\` | $result |" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$rc" -ne 0 ]; then
+              if [ "$BRAVA_TEST_GATE" = block ]; then
+                echo "::error file=$file::Brava test: $result"
+                blocked=1
+              else
+                echo "::warning file=$file::Brava test: $result (not blocking Prod: BRAVA_TEST_GATE=warn)"
+              fi
+            fi
+          done
+          exit "$blocked"
+
+  prod:
+    needs: dev
+    runs-on: ubuntu-latest
+    environment: secops-prod   # optional: add required reviewers in the repository settings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.SECOPS_DEPLOY_SA }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install "secops==0.44.1"
+      - name: Deploy to Prod
+        env:
+          CUSTOMER_ID: ${{ vars.PROD_CUSTOMER_ID }}
+          PROJECT: ${{ vars.PROD_PROJECT }}
+          REGION: ${{ vars.PROD_REGION }}
+          FILES: ${{ needs.dev.outputs.rules }}
+        run: |
+          set -euo pipefail
+          sx() { secops --customer-id "$CUSTOMER_ID" --project-id "$PROJECT" --region "$REGION" "$@"; }
+          for file in $FILES; do
+            name=$(sed -nE 's/^[[:space:]]*rule[[:space:]]+([A-Za-z_][A-Za-z0-9_]*).*/\1/p' "$file" | head -n1)
+            ids=$(sx rule list --view BASIC --as-list \
+              | jq -r --arg n "$name" '.[] | select(.displayName == $n) | .name | split("/") | last')
+            if [ "$(printf '%s' "$ids" | grep -c .)" -gt 1 ]; then
+              echo "::error file=$file::'$name' matches several rules in Prod: $(echo $ids). Archive or rename the extra ones, or deploy it with an explicit ID."
+              exit 1
+            fi
+            rule_id=$ids
+            if [ -z "$rule_id" ]; then
+              rule_id=$(sx rule create --file "$file" | jq -er '.name | split("/") | last')
+            else
+              sx rule update --id "$rule_id" --file "$file" > /dev/null
+            fi
+            sx rule update-deployment --id "$rule_id" --enabled true --alerting true > /dev/null
+            echo "Deployed $name ($rule_id) to Prod"
+          done

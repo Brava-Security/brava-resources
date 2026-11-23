@@ -1,0 +1,31 @@
+# "Delete the rule from Dev after testing", once it is in Prod: https://docs.brava.security/hygiene/detection-as-code/
+# Not a complete workflow: add this job under jobs: in detections-deploy.yml.
+  dev-cleanup:
+    needs: [dev, prod]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.SECOPS_DEPLOY_SA }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install "secops==0.44.1"
+      - name: Delete the tested rules from Dev
+        env:
+          CUSTOMER_ID: ${{ vars.DEV_CUSTOMER_ID }}
+          PROJECT: ${{ vars.DEV_PROJECT }}
+          REGION: ${{ vars.DEV_REGION }}
+          FILES: ${{ needs.dev.outputs.rules }}
+        run: |
+          set -euo pipefail
+          sx() { secops --customer-id "$CUSTOMER_ID" --project-id "$PROJECT" --region "$REGION" "$@"; }
+          for file in $FILES; do
+            name=$(sed -nE 's/^[[:space:]]*rule[[:space:]]+([A-Za-z_][A-Za-z0-9_]*).*/\1/p' "$file" | head -n1)
+            for id in $(sx rule list --view BASIC --as-list \
+              | jq -r --arg n "$name" '.[] | select(.displayName == $n) | .name | split("/") | last'); do
+              sx rule delete --id "$id" --force > /dev/null
+            done
+          done

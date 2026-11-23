@@ -1,0 +1,65 @@
+# Option 2 of "Add Brava's injection test to a deploy workflow you already have": https://docs.brava.security/hygiene/detection-as-code/
+# Copy to .github/workflows/ on your default branch. Set workflows: to your deploy workflow's name:.
+name: detections-test
+on:
+  workflow_run:
+    workflows: ["detections-deploy"]   # the name: of your deploy workflow
+    types: [completed]
+
+jobs:
+  brava-test:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    env:
+      BRAVA_API_TOKEN: ${{ secrets.BRAVA_API_TOKEN }}
+      BRAVA_URL: https://console.brava.security
+      BRAVA_SIEM: SecOps Dev
+      BRAVA_TEST_GATE: ${{ vars.BRAVA_TEST_GATE || 'warn' }}
+      SHA: ${{ github.event.workflow_run.head_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install "brava-cli==0.4.0"
+      - run: brava doctor
+      - name: Test the rules that run deployed
+        run: |
+          set -euo pipefail
+          blocked=0
+          {
+            echo "### Brava detection tests (gate: $BRAVA_TEST_GATE)"
+            echo "| Rule | Result |"
+            echo "|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for file in $(git diff --no-renames --name-only --diff-filter=AM "$SHA~1" "$SHA" -- 'rules/*.yaral'); do
+            rule=$(sed -nE 's/^[[:space:]]*rule[[:space:]]+([A-Za-z_][A-Za-z0-9_]*).*/\1/p' "$file" | head -n1)
+            echo "::group::Verify $rule"
+            rc=0
+            if id=$(brava run test create --siem "$BRAVA_SIEM" --rule "$rule" --json | jq -er .id); then
+              brava run test watch "$id" --fail-on high || rc=$?
+            else
+              rc=1
+            fi
+            echo "::endgroup::"
+            case "$rc" in
+              0) result="passed" ;;
+              2) result="did not pass: the rule did not fire, a check failed, or a finding reached --fail-on" ;;
+              4) result="no answer: inconclusive or not telemetry-driven" ;;
+              3) result="timed out" ;;
+              *) result="could not run (exit $rc)" ;;
+            esac
+            echo "| \`$rule\` | $result |" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$rc" -ne 0 ]; then
+              if [ "$BRAVA_TEST_GATE" = block ]; then
+                echo "::error file=$file::Brava test: $result"
+                blocked=1
+              else
+                echo "::warning file=$file::Brava test: $result"
+              fi
+            fi
+          done
+          exit "$blocked"
