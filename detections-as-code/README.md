@@ -16,10 +16,13 @@ Three modes, one command surface:
 
 1. A Google SecOps instance connected to Brava Hygiene. For `test`, the optional detection telemetry testing
    grant on the dev instance (see [Detection telemetry testing](https://docs.brava.security/hygiene/detection-testing/#prerequisites-and-setup)).
-2. A Brava API key with scopes `hygiene:read` and `hygiene:detections:test`, created in Settings → API Keys
-   from a dedicated integration user (keys stop working if their creator is removed from the tenant).
+2. A Brava API key with scopes `hygiene:read` and `hygiene:detections:test`: in the Brava console, click your avatar
+   (top right) > **API Keys** > **Create API Key** (requires the admin role). Create it from a dedicated integration
+   user (keys stop working if their creator is removed from the tenant).
 3. Rules stored as YARA-L files. Brava looks up the live rule by its display name, which is the YARA-L `rule <name>`,
-   so your pipeline must deploy a changed rule to the SIEM before validating it.
+   so a pipeline that tests a rule must deploy it to the SIEM first. The [`github/pipeline/`](github/pipeline/)
+   workflows also check a rule file's text before it is deployed (`brava run sweep create --file`, brava-cli 0.4.0
+   or later).
 
 Check the key once from a terminal:
 
@@ -35,6 +38,7 @@ brava siems list
 | Path | What it is |
 |---|---|
 | [`github/action/`](github/action/) | A composite GitHub Action: installs the CLI, validates a list of rules, writes a job summary, annotations and a results directory, and fails when a rule fails. Reference it as `Brava-Security/brava-resources/detections-as-code/github/action@main`. |
+| [`github/pipeline/`](github/pipeline/) | The workflows from the [Detection-as-Code Pipeline](https://docs.brava.security/hygiene/detection-as-code/) guide: check rule files on pull requests, deploy to Dev with Google's SecOps CLI, test with injected telemetry, then deploy to Prod. Plus the guide's snippets for adding Brava's test to a deploy workflow you already have. |
 | [`github/examples/pr-gate.yml`](github/examples/pr-gate.yml) | Changed rules must fire in dev before merge. Sticky PR comment with one row per rule. |
 | [`github/examples/nightly-regression.yml`](github/examples/nightly-regression.yml) | Scheduled re-test of a curated list, with a tracking issue on failure. Catches silent field or value drift. |
 | [`github/examples/post-deploy-prod-sweep.yml`](github/examples/post-deploy-prod-sweep.yml) | After a merge deploys to production, sweep each changed rule on every production SIEM in parallel. |

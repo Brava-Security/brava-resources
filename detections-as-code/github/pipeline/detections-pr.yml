@@ -1,0 +1,36 @@
+# Stage 1 of https://docs.brava.security/hygiene/detection-as-code/
+# Copy to .github/workflows/ and change the items listed under "Complete GitHub Actions example".
+name: detections-pr
+on:
+  pull_request:
+    paths: ["rules/**.yaral"]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    env:
+      BRAVA_API_TOKEN: ${{ secrets.BRAVA_API_TOKEN }}
+      BRAVA_URL: https://console.brava.security
+      BRAVA_SIEM: SecOps Dev
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install "brava-cli==0.4.0"
+      - run: brava doctor
+      - name: Check new and changed rules
+        run: |
+          set -euo pipefail
+          rc=0
+          git diff --name-only --diff-filter=AM "origin/${{ github.base_ref }}"...HEAD -- 'rules/*.yaral' > changed.txt
+          while read -r file; do
+            if id=$(brava run sweep create --siem "$BRAVA_SIEM" --file "$file" --json | jq -er .id); then
+              brava run sweep watch "$id" --fail-on high || { echo "::error file=$file::Brava checks failed (exit $?)"; rc=1; }
+            else
+              echo "::error file=$file::could not start the Brava check"; rc=1
+            fi
+          done < changed.txt
+          exit "$rc"
